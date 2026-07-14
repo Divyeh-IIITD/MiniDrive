@@ -1,0 +1,107 @@
+Day 1 Report — MiniDrive
+========================
+
+Overview
+--------
+This document summarizes the Day 1 work for the MiniDrive interview project: code added, the purpose of each function/module, why the chosen approach was used, trade-offs accepted, and realistic alternatives where relevant.
+
+Files added (high level)
+- minidrive/chunking.py — streaming chunk iterator and `Chunk` dataclass
+- minidrive/distribution.py — `RoundRobinDistributor` (assign_by_index, assign_next)
+- minidrive/replication.py — `Replicator` (replicate_chunk, _post_chunk_to_node)
+- coordinator/main.py — FastAPI upload handler using streaming chunk writes
+- storage-node/main.py — FastAPI endpoints to store and serve chunks
+- frontend/* — Vite + React scaffold (package.json, index.html, src/App.jsx, src/main.jsx)
+- tests/* — unit tests for chunking, distribution, replication
+- README.md, requirements.txt
+
+Day 1 Tasks (chronological)
+----------------------------
+1) Implement streaming chunking (minidrive/chunking.py)
+   - What: `iter_chunks(stream, chunk_size)` yields `Chunk(index, data)` by repeatedly reading `chunk_size` bytes.
+   - Why: Streaming keeps memory at O(chunk_size) rather than O(file_size). This is crucial for large uploads to avoid OOM and to enable immediate per-chunk processing (replication, hashing, metadata writes). Using the file object's .read(chunk_size) is the simplest, lowest-overhead way to stream a file without extra copies.
+   - Trade-offs: Single-pass streaming prevents random access without reopening/rewinding the source. Also, callers must manage chunk indices if determinism is needed. We accepted this because uploads are typically streamed once and processed as they arrive.
+   - Alternatives considered:
+     * Read entire file then slice into chunks — simple to implement, but O(file_size) memory, unacceptable for large files.
+     * Memory-mapped files — good for large local files but not available for streamed HTTP uploads.
+   - Tests written: empty file, exact-boundary chunks, partial tail chunk, invalid chunk-size rejection.
+
+2) Implement chunk distribution (minidrive/distribution.py)
+   - What: `RoundRobinDistributor` with `assign_by_index(chunk_index)` and `assign_next()`.
+   - Why: `assign_by_index` is stateless and deterministic (O(1) time, O(1) space). Determinism simplifies retries and idempotency: any worker can compute targets for a given chunk index independently.
+   - Trade-offs: Round-robin by index ignores current node load and may cause uneven distribution if chunk sizes vary widely. `assign_next()` maintains mutable internal state and is protected by a small lock for thread-safety; used when callers don't want to track indices.
+   - Alternatives considered:
+     * Least-loaded selection (choose node with lowest current load): better balance in practice but requires tracking live metrics and synchronization (e.g., heap or sorted structure with O(log N) selection and updates), increasing complexity and race surfaces.
+   - Tests written: assign_by_index mapping, assign_next sequence, empty-node list rejection.
+
+3) Implement replication (minidrive/replication.py)
+   - What: `Replicator.replicate_chunk(chunk)` attempts to write a chunk to `replication_factor` distinct nodes. It computes a deterministic candidate ordering starting at `chunk.index % N` and walks the ring trying nodes until the replication factor is met.
+   - Why: Deterministic ordering allows independent orchestrators/clients to compute the same primary targets for a chunk and to retry in a predictable order. Sequential writes were chosen for simplicity and to reduce simultaneous network resource usage; error handling is straightforward (try next candidate on failure).
+   - Trade-offs: Sequential writes increase wall-clock latency compared to parallel writes. We accepted sequential behavior for clarity and to keep resource usage low for an interview demo. Also, partial failures are handled by attempting alternate nodes; final failure raises a `ReplicationError` which the coordinator layer can handle (retry metadata, alert user, cleanup).
+   - Alternatives considered:
+     * Parallel writes to replication targets (fire off multiple requests concurrently) — reduces latency but requires aggregating results and handling partial-success semantics carefully (which nodes succeeded, which need cleanup or retry).
+     * Background async replication with eventual consistency — more complex state tracking and reconciliation.
+   - Tests written: full success, one node failing then alternate succeeds, all nodes failing raises `ReplicationError`.
+
+4) Scaffolding: coordinator and storage-node FastAPI apps
+   - What (coordinator/main.py): `POST /upload` endpoint accepts `UploadFile`, obtains its underlying `.file` binary stream, and writes chunk files (1MB default) using `iter_chunks`. Returns chunk count.
+   - Why: Keeping the coordinator in Python/FastAPI keeps the file streaming code consistent and leverages FastAPI's straightforward async endpoints for later orchestration. FastAPI integrates well with uvicorn and asyncio if we later parallelize replication.
+   - Trade-offs: Python is not as fast as some compiled servers, but for an interview prototype it reduces implementation complexity and testability. Node/Express was considered but provides no direct streaming advantage for this particular demo and would split the language surface.
+   - What (storage-node/main.py): endpoints to `POST /chunks/{file_id}/{chunk_index}` (store raw bytes) and `GET /chunks/{file_id}/{chunk_index}` (stream the chunk back with a small read buffer).
+   - Why: Keeping storage nodes minimalist (store/serve bytes) delegates control plane complexity to the coordinator and simplifies reasoning about node failure modes.
+   - Trade-offs: Nodes currently accept raw bytes without checksums or partial-write detection. Day 2 should add integrity checks and conditional GET support (ETag/Last-Modified).
+
+5) Frontend scaffold (frontend/)
+   - What: Vite + React minimal scaffold with placeholder UI.
+   - Why: React is ubiquitous for interview demos; Vite gives fast dev server and simple bundling. The frontend will later implement an upload component with progress reporting and a file browser.
+   - Trade-offs: Minimal placeholder only; no production build configuration beyond Vite defaults.
+
+Testing and validation
+----------------------
+- Ran Python unit tests after each implementation step. Final test run: `python -m unittest discover -s tests` — all tests pass (chunking, distribution, replication tests).
+
+Design notes and rationale (deeper detail)
+-----------------------------------------
+- Streaming vs read-then-split: streaming keeps memory bounded by the chunk size and begins useful work (replication/hashing) sooner. read-then-split needs the full payload resident in memory or in a temporary file, doubling I/O and using more disk or memory. For large files (100s of MB or GB) streaming is effectively required.
+
+- Chunk size tradeoffs:
+  * Too small (e.g., <=64KB): metadata explosion — more chunk records in DB, more network requests, and higher per-chunk overhead (HTTP headers, TCP handshake costs if not reused). Increases CPU overhead per chunk.
+  * Too large (e.g., >=16MB): poor parallelism and coarser failure domains — a single slow node or network problem stalls more data; replication writes take longer and cause backpressure. Memory usage on nodes during transfer increases.
+  * Middle ground (1MB): reasonable balance for demo/interview systems; supports parallelism and manageable metadata size.
+
+- Distribution selection rationale:
+  * Deterministic modulo mapping (`node = nodes[chunk_index % N]`) is O(1), stateless, and idempotent. Good for simple coordinator-less retries and predictable placement.
+  * Real systems often combine consistent hashing (to scale node sets) or load-based selection. Consistent hashing reduces data movement under node membership changes but complicates replication target selection and requires more bookkeeping.
+
+- Replication strategy rationale:
+  * Chosen: write to `replication_factor` distinct nodes starting from a deterministic primary. Sequential attempts keep implementation simple and the error model predictable.
+  * Alternatives: parallel writes (faster but more complex), quorum-based writes (used in distributed stores for strong guarantees), or erasure coding (space-efficient redundancy but complex encoding/decoding overhead).
+
+Open items / Next steps (Day 2 suggestions)
+------------------------------------------
+1. Add metadata DB (PostgreSQL) schema and atomic commit flow for files and chunks. Use transactions to ensure all-or-nothing commits and record chunk locations only after successful writes.
+2. Add concurrency control tests and intentionally introduce a race condition for demonstration, then fix it with appropriate locking (row-level locks or optimistic concurrency with retries). Document both versions for interview storytelling.
+3. Implement conditional GET (ETag/Last-Modified) on storage nodes and coordinator, returning 304 when appropriate.
+4. Implement LRU cache for hot chunks on storage nodes (doubly linked list + hash map) with unit tests.
+5. Build React upload UI with progress; decide between WebSocket (real-time push) or polling (simpler). For Day 1, polling or simple server-sent progress is acceptable; WebSocket provides lower-latency progress updates for large, multi-chunk uploads.
+
+Debugging log (to be completed after Day 2)
+------------------------------------------
+Will include 2-3 real bugs, how they were found (race, replication partial failure, incorrect chunk sizing), and how fixed. Intentionally delay until we see concurrency and replication issues in practice so the log is factual.
+
+Appendix: Key functions and their one-line descriptions
+------------------------------------------------------
+- `iter_chunks(stream, chunk_size)` — stream a binary file into fixed-size chunks.
+- `RoundRobinDistributor.assign_by_index(chunk_index)` — deterministic mapping of chunk to node.
+- `RoundRobinDistributor.assign_next()` — thread-safe next-node assignment for streaming callers.
+- `Replicator.replicate_chunk(chunk)` — ensure chunk is written to `replication_factor` nodes by trying candidates deterministically and falling back on failure.
+- `coordinator.main.upload()` — FastAPI endpoint that accepts an `UploadFile`, streams it into chunk files using `iter_chunks`, and returns the number of chunks written.
+- `storage-node.main.store_chunk()` — HTTP POST endpoint to accept raw chunk bytes and write to local disk.
+- `storage-node.main.get_chunk()` — HTTP GET endpoint that streams a stored chunk back to the caller.
+
+If you'd like, I can now:
+- Add the PostgreSQL schema and implement the atomic metadata transaction (Day 2 core step).
+- Implement the concurrency race demo and then fix it (required for the interview narrative).
+- Draft the debugging log entries post-fix.
+
+End of Day 1 report.

@@ -1,0 +1,1 @@
+"""MiniDrive coordinator package."""
