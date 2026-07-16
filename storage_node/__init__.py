@@ -1,0 +1,1 @@
+"""MiniDrive storage node package."""

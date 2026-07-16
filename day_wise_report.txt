@@ -105,3 +105,51 @@ If you'd like, I can now:
 - Draft the debugging log entries post-fix.
 
 End of Day 1 report.
+
+Day 2 Report — Storage-Node API
+===============================
+
+Task implemented
+----------------
+Built the storage-node API with content-addressed chunk storage:
+- `POST /chunks` accepts raw chunk bytes plus an `X-Chunk-Hash` header
+- `GET /chunks/{hash}` returns raw chunk bytes
+- `DELETE /chunks/{hash}` removes the stored chunk
+
+Core implementation details
+---------------------------
+- Storage layout uses git-style sharding by hash prefix: the first 2 hex characters form the directory, and the remaining characters form the filename.
+- Incoming chunk bodies are streamed through a SHA-256 hasher while being written to a temporary file, then atomically moved into place once the computed digest matches the supplied hash.
+- Duplicate uploads are deduplicated by checking whether the final hash path already exists.
+- Deletes remove the chunk and clean up empty parent directories when possible.
+
+Why content-addressed storage was used
+--------------------------------------
+- Deduplication: if the same bytes arrive again, they map to the same hash and the storage node can skip rewriting the same object.
+- Integrity verification: the stored object is named by its digest, so the node can compare the computed hash with the supplied hash before committing the file.
+- Deterministic lookup: a hash is a stable identity for the data, so GET and DELETE use a direct O(1)-style path lookup instead of needing a separate index of sequential IDs.
+
+Why this beats sequential IDs for this project
+----------------------------------------------
+- Sequential IDs identify an insertion order, not the content itself, so duplicate chunks would still be stored multiple times unless we add a separate dedupe index.
+- If a chunk is corrupted in transit, a sequential ID gives no built-in validation. A content hash gives immediate verification.
+- Sequential IDs can be convenient for human debugging, but they do not support dedupe or integrity checking as naturally as content-addressed storage does.
+
+Trade-offs accepted
+-------------------
+- Hash-based names are longer than short numeric IDs, so path lengths are larger and directory names are less human-friendly.
+- Deleting a chunk immediately is simple, but a production system would usually need reference counting or garbage collection if multiple files share the same chunk.
+- Writing to a temp file and renaming is slightly more disk-heavy than writing directly, but it avoids partially written final objects.
+
+Alternatives considered
+-----------------------
+- Sequential IDs plus a metadata table: simpler to read for humans, but dedupe requires an extra lookup table and hash verification becomes a separate step.
+- UUIDs: better uniqueness than sequence numbers, but still do not encode content identity, so they do not solve dedupe by themselves.
+- Full object store abstraction: powerful for larger systems, but overkill for the interview-sized storage node.
+
+Validation
+----------
+- Ran the full Python test suite after adding the storage-node API.
+- Result: all tests passed.
+
+End of Day 2 report.
