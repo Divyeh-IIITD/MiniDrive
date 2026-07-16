@@ -106,50 +106,68 @@ If you'd like, I can now:
 
 End of Day 1 report.
 
-Day 2 Report — Storage-Node API
-===============================
+Day 2 Report — MiniDrive
+========================
 
-Task implemented
-----------------
-Built the storage-node API with content-addressed chunk storage:
-- `POST /chunks` accepts raw chunk bytes plus an `X-Chunk-Hash` header
-- `GET /chunks/{hash}` returns raw chunk bytes
-- `DELETE /chunks/{hash}` removes the stored chunk
+Overview
+--------
+This document summarizes the Day 2 work for the MiniDrive interview project: the storage-node API, its content-addressed layout, and the reasoning behind the design choices.
 
-Core implementation details
+Files added (high level)
+- storage_node/main.py — FastAPI storage-node API using content-addressed chunk storage
+- storage-node/main.py — legacy launcher for the storage node
+- tests/test_storage_node.py — unit tests for store/get/delete and deduplication behavior
+- requirements.txt — added runtime/test dependencies for FastAPI uploads
+- README.md — documented the storage-node API and run commands
+
+Day 2 Tasks (chronological)
 ---------------------------
-- Storage layout uses git-style sharding by hash prefix: the first 2 hex characters form the directory, and the remaining characters form the filename.
-- Incoming chunk bodies are streamed through a SHA-256 hasher while being written to a temporary file, then atomically moved into place once the computed digest matches the supplied hash.
-- Duplicate uploads are deduplicated by checking whether the final hash path already exists.
-- Deletes remove the chunk and clean up empty parent directories when possible.
+1) Build the storage-node API (storage_node/main.py)
+   - What: Implemented `POST /chunks`, `GET /chunks/{hash}`, and `DELETE /chunks/{hash}` for chunk storage.
+   - Why: The storage node should only store and serve raw chunk bytes. Keeping the API small makes failure modes easier to reason about and keeps the coordinator in charge of control-plane logic.
+   - Trade-offs: The node currently does not track chunk reference counts or garbage collection across files that may share the same content hash.
+   - Alternatives considered:
+     * Sequential IDs with a separate metadata index — easier to read manually, but it does not naturally support deduplication.
+     * UUID-based names — unique, but still not content-aware, so integrity verification and dedupe remain separate concerns.
 
-Why content-addressed storage was used
---------------------------------------
-- Deduplication: if the same bytes arrive again, they map to the same hash and the storage node can skip rewriting the same object.
-- Integrity verification: the stored object is named by its digest, so the node can compare the computed hash with the supplied hash before committing the file.
-- Deterministic lookup: a hash is a stable identity for the data, so GET and DELETE use a direct O(1)-style path lookup instead of needing a separate index of sequential IDs.
+2) Use content-addressed storage with hash-prefix sharding
+   - What: Stored each chunk under a path derived from its SHA-256 hash, using the first two hex characters as a directory prefix and the remainder as the filename.
+   - Why: Content-addressed storage provides deduplication because identical bytes map to the same hash. It also provides integrity verification because the hash is derived from the data itself. Hash-prefix sharding keeps directory sizes manageable and avoids putting too many files in one folder.
+   - Trade-offs: Hash-based paths are longer and less human-friendly than sequential IDs, and delete operations may need later garbage collection if the same chunk is referenced by multiple files.
+   - Alternatives considered:
+     * Flat directory by hash — simpler, but large directories can become slow to list and manage.
+     * Sequential IDs — simple naming, but no built-in dedupe or integrity guarantee.
 
-Why this beats sequential IDs for this project
-----------------------------------------------
-- Sequential IDs identify an insertion order, not the content itself, so duplicate chunks would still be stored multiple times unless we add a separate dedupe index.
-- If a chunk is corrupted in transit, a sequential ID gives no built-in validation. A content hash gives immediate verification.
-- Sequential IDs can be convenient for human debugging, but they do not support dedupe or integrity checking as naturally as content-addressed storage does.
+3) Stream chunk writes through a temporary file before commit
+   - What: Read the request body as a stream, update a SHA-256 digest incrementally, and write bytes to a temporary file before atomically moving it into place.
+   - Why: Streaming keeps memory usage bounded by the chunk size instead of the full request size. The temp-file-and-rename pattern avoids partially written final objects if the request is interrupted or the hash check fails.
+   - Trade-offs: This is slightly more disk-heavy than writing directly to the final path, but the safety and atomicity are worth it for a storage node.
+   - Alternatives considered:
+     * Buffer everything in memory first — simple, but memory usage grows with file size.
+     * Write directly to the final file — faster in the happy path, but risks leaving corrupted partial objects.
 
-Trade-offs accepted
--------------------
-- Hash-based names are longer than short numeric IDs, so path lengths are larger and directory names are less human-friendly.
-- Deleting a chunk immediately is simple, but a production system would usually need reference counting or garbage collection if multiple files share the same chunk.
-- Writing to a temp file and renaming is slightly more disk-heavy than writing directly, but it avoids partially written final objects.
+4) Add tests for round-trip storage, deduplication, and hash mismatch rejection
+   - What: Added unit tests that upload a chunk, retrieve it, delete it, upload it twice to check deduplication, and reject mismatched hashes.
+   - Why: These tests prove the API works for the core storage lifecycle and catch the main correctness risks: duplicate writes, corrupted uploads, and missing cleanup.
+   - Trade-offs: The tests exercise the public API, not filesystem edge cases like permission errors or disk exhaustion.
+   - Alternatives considered:
+     * Mocking every filesystem call — more isolated, but less representative of the real behavior.
+     * End-to-end tests against a running server — useful later, but slower than unit tests for this stage.
 
-Alternatives considered
------------------------
-- Sequential IDs plus a metadata table: simpler to read for humans, but dedupe requires an extra lookup table and hash verification becomes a separate step.
-- UUIDs: better uniqueness than sequence numbers, but still do not encode content identity, so they do not solve dedupe by themselves.
-- Full object store abstraction: powerful for larger systems, but overkill for the interview-sized storage node.
+5) Update project documentation
+   - What: Updated `README.md` with the repo layout, run commands, and the storage-node curl examples.
+   - Why: The README now reflects the actual workspace structure and gives a fast path for reviewers to run the Day 2 API.
+   - Trade-offs: The README is intentionally concise, so deeper architecture details remain in this report.
 
-Validation
-----------
-- Ran the full Python test suite after adding the storage-node API.
+Testing and validation
+----------------------
+- Ran the full Python unit test suite after the storage-node API changes.
 - Result: all tests passed.
+
+Design notes and rationale
+--------------------------
+- Content-addressed storage was preferred over sequential IDs because it makes deduplication and integrity verification properties of the naming scheme itself.
+- The hash-prefix directory layout is a practical compromise between simplicity and filesystem scalability.
+- Streaming the upload body through a digest and temporary file keeps memory usage low while preserving atomic commit semantics.
 
 End of Day 2 report.
