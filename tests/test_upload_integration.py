@@ -10,8 +10,12 @@ from pathlib import Path
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import StaticPool
 
 from coordinator import main as coordinator_main
+from coordinator.db import Base
 from minidrive.chunking import iter_chunks
 from minidrive.distribution import RoundRobinDistributor
 from minidrive.replication import Replicator
@@ -46,6 +50,14 @@ class UploadIntegrationTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
         root = Path(self.temp_dir.name)
+
+        self.engine = create_engine(
+            "sqlite+pysqlite:///:memory:",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        Base.metadata.create_all(self.engine)
+        coordinator_main.SessionLocal = sessionmaker(bind=self.engine, autoflush=False, autocommit=False, expire_on_commit=False)
 
         self.node_clients = {}
         self.node_urls = []

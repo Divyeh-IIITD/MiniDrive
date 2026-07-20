@@ -232,3 +232,78 @@ Replicator and distributor outcome
 - In other words, the integration work did not require a new placement algorithm or a different replication strategy; it required wiring the existing pieces together with the correct transport contract.
 
 End of Day 3 report.
+
+Day 4 Report — MiniDrive
+========================
+
+Overview
+--------
+This document summarizes the Day 4 work for MiniDrive: adding the PostgreSQL metadata layer, making upload completion atomic at the database boundary, and recording the crash semantics explicitly so the control plane never reports a committed file without its chunk records.
+
+Files updated (high level)
+- coordinator/db.py — SQLAlchemy models for files, chunks, and chunk_locations
+- coordinator/main.py — upload flow now records file state and commits metadata atomically
+- migrations/env.py — Alembic environment wiring
+- migrations/versions/0001_upload_metadata_schema.py — initial PostgreSQL schema migration
+- requirements.txt — SQLAlchemy, Alembic, and psycopg dependencies
+- tests/test_upload_metadata.py — tests for successful commit, failure handling, and integration persistence
+
+Day 4 Tasks (chronological)
+---------------------------
+1) Design the metadata schema (coordinator/db.py, migrations/versions/0001_upload_metadata_schema.py)
+   - What: Added normalized PostgreSQL tables for `files`, `chunks`, and `chunk_locations`.
+   - Why: `files` tracks upload lifecycle and file-level metadata; `chunks` stores per-chunk content metadata once; `chunk_locations` records replication targets for each chunk without duplicating chunk identity or size data.
+   - Trade-offs: This introduces more joins than a denormalized design, but it avoids update anomalies and keeps replication metadata separate from content metadata.
+   - Alternatives considered:
+     * Put node URLs directly on `chunks` — simpler at first glance, but it breaks down as soon as one chunk has multiple replicas because the chunk row would need repeating or mutable multi-value fields.
+     * Store everything in one JSON column — flexible, but harder to query, constrain, index, and evolve safely.
+   - Function-by-function:
+     * `FileRecord` models upload lifecycle (`uploading`, `committed`, `failed`).
+     * `ChunkRecord` stores the chunk hash, index, and size once per chunk.
+     * `ChunkLocationRecord` stores one row per node replica and marks whether that node is primary.
+
+2) Add the database connection and migration tooling (coordinator/db.py, migrations/env.py, alembic.ini)
+   - What: Added SQLAlchemy as the connection/model layer and Alembic as the migration system.
+   - Why: SQLAlchemy gives explicit transaction control for the atomic commit step, while Alembic keeps schema changes versioned instead of hand-applied.
+   - Trade-offs: This is slightly more setup than a raw SQL script, but the migration history is much safer for a project that will keep evolving.
+   - Alternatives considered:
+     * Raw SQL migration files — lower abstraction, but more manual boilerplate and less ergonomic model reuse.
+     * A lighter driver like psycopg alone — good for direct SQL, but it leaves us without a structured ORM layer for the upload flow.
+   - Function-by-function:
+     * `SessionLocal` creates short-lived database sessions for each upload phase.
+     * Alembic `env.py` points migrations at the same metadata definitions used by the app.
+
+3) Make upload metadata writes atomic (coordinator/main.py)
+   - What: Updated `POST /upload` so it inserts a `files` row with `status='uploading'` before chunking starts, records successful chunk and location rows after replication, and flips the file to `committed` inside one final transaction.
+   - Why: The coordinator now guarantees that a caller can only see `committed` after all chunk metadata has been persisted. This is the key durability boundary for the metadata layer.
+   - Trade-offs: Chunk/location writes are batched at the end rather than inserted after every chunk. That keeps the commit boundary simple and avoids exposing half-finished uploads as committed. The trade-off is that a crash before the final transaction means the metadata for already replicated chunks is not yet persisted.
+   - Alternatives considered:
+     * Insert chunk rows one by one during upload — easier to see progress in the database, but harder to make the final committed state atomic.
+     * Keep all metadata only in memory until the end — simplest for atomicity, but it makes failure recovery and debugging weaker.
+   - Function-by-function:
+     * `_create_upload_record()` inserts the initial file row with `uploading` status.
+     * `_commit_upload_metadata()` writes chunk and location rows, then sets `committed` in one transaction.
+     * `_mark_upload_failed()` records a failed upload state when replication cannot complete.
+
+Crash semantics
+---------------
+- If the process crashes after inserting the `files` row but before any `chunks` rows exist, the database contains an `uploading` file with no chunk metadata. That is visible as in-progress work, not as a completed file.
+- If the process crashes after chunk/location rows are prepared but before the final commit transaction finishes, PostgreSQL rolls back the entire transaction. That means no caller can ever observe a `committed` file unless all its chunk and location records were written too.
+- This transaction boundary is the key guarantee: `committed` is only visible after the full metadata set is durable.
+
+Testing and validation
+----------------------
+- Added tests for successful upload commit, simulated failure, and end-to-end persistence against in-process storage nodes plus a temporary database.
+- Final validation will run the new DB tests and the existing Day 3 integration test once the schema/report step is confirmed.
+
+Debugging log
+-------------
+- The main integration issue was choosing the right persistence boundary. I initially kept all metadata in the upload response path only, which meant the coordinator lost the record after replying. The fix was to split the flow into an initial `uploading` row, per-chunk tracking in memory, and a final atomic commit transaction.
+- Another subtle issue was testability: the production database URL points at PostgreSQL, but the tests need to run in the workspace without assuming a live server. I handled that by overriding the coordinator session factory in tests with a temporary SQLite engine, while leaving production code on PostgreSQL.
+
+Confirmation on the Day 3 pipeline
+----------------------------------
+- The Day 3 chunking, round-robin placement, and sequential replication logic did not need algorithmic changes to support the database layer.
+- What changed was the control-plane sequencing: Day 4 adds persistence and an atomic metadata commit on top of the already working Day 3 upload flow.
+
+End of Day 4 report.
