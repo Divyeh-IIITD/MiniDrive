@@ -171,3 +171,64 @@ Design notes and rationale
 - Streaming the upload body through a digest and temporary file keeps memory usage low while preserving atomic commit semantics.
 
 End of Day 2 report.
+
+Day 3 Report — MiniDrive
+========================
+
+Overview
+--------
+This document summarizes the Day 3 integration work for MiniDrive: wiring the existing chunking, distribution, replication, and storage-node modules into one end-to-end upload flow, then proving the flow with a real multi-chunk file.
+
+Files updated (high level)
+- coordinator/main.py — upload endpoint now computes chunk hashes, assigns targets, replicates over HTTP, and returns per-chunk results
+- minidrive/replication.py — POSTs chunks to storage nodes with the required `X-Chunk-Hash` header
+- minidrive/config.py — static storage-node URL list and replication factor
+- tests/test_upload_integration.py — integration test for the coordinator upload path against in-process storage nodes
+
+Day 3 Tasks (chronological)
+---------------------------
+1) Wire the coordinator upload path end to end (coordinator/main.py)
+  - What: Updated `POST /upload` to stream chunks from `iter_chunks`, compute each chunk's SHA-256 hash, determine the primary node with `RoundRobinDistributor.assign_by_index()`, call `Replicator.replicate_chunk()`, and collect a structured per-chunk result.
+  - Why: The coordinator now acts as the control plane for the upload flow instead of only chunking locally. That lets it produce the chunk metadata a future database layer will need without adding new distributed-system features yet.
+  - Trade-offs: The endpoint still uses a simple in-memory response structure rather than persisting metadata. That is intentional for this integration milestone: it proves the transport and placement logic first, before adding atomic database writes or recovery logic.
+  - Function-by-function:
+    * `upload()` streams the file, computes hashes, triggers replication, and returns `file_id`, `total_chunks`, and per-chunk status.
+    * `_replica_targets_for_chunk()` derives the target node set from the round-robin placement so the response can show which nodes were intended for each chunk.
+
+2) Align replication with the storage-node API (minidrive/replication.py)
+  - What: Changed `_post_chunk_to_node()` to send the chunk bytes to `/chunks` with an `X-Chunk-Hash` header, matching the storage-node contract.
+  - Why: The storage node is content-addressed and verifies the payload hash before committing the object. Without the header, the coordinator could not store data successfully.
+  - Trade-offs: Replication is still sequential, which keeps the error handling simple and deterministic but is slower than parallel writes. That was acceptable for proving correctness first.
+  - Function-by-function:
+    * `replicate_chunk()` still chooses candidates deterministically and retries on alternate nodes until the replication factor is met.
+    * `_post_chunk_to_node()` now constructs the correct HTTP request for the storage-node API.
+
+3) Add static node configuration (minidrive/config.py)
+  - What: Added a hardcoded list of 2-3 storage-node URLs and a replication factor constant.
+  - Why: Discovery was intentionally deferred. Hardcoding the node list makes the integration path easy to reason about and test while we validate the rest of the stack.
+  - Trade-offs: This does not scale to a dynamic cluster. That is fine for now because the goal was to prove the upload flow works before introducing another moving part.
+
+4) Prove the flow with an integration test (tests/test_upload_integration.py)
+  - What: Added an integration test that spins up isolated in-process storage-node apps, uploads a multi-chunk file through the coordinator's `/upload` endpoint, and verifies each returned hash by querying `GET /chunks/{hash}` directly.
+  - Why: This tests the real handoff between coordinator and storage nodes instead of only mocking helper functions. It catches mismatches in request format, headers, chunk hashing, and chunk placement.
+  - Trade-offs: The test uses in-process FastAPI apps instead of separate OS processes, so it validates the HTTP contract and storage behavior but not process supervision or network bootstrapping.
+
+Testing and validation
+----------------------
+- Ran the new integration test: passed.
+- Ran the full Python unit test suite: passed.
+- Manually uploaded a 5MB+ file through the coordinator and verified the stored chunk files on disk under each storage node's hash-prefixed directories.
+
+Debugging log
+-------------
+- Bug 1: The replication layer was posting raw bytes without the `X-Chunk-Hash` header required by the storage-node API. This showed up as a contract mismatch once I traced the coordinator path into storage-node `POST /chunks`. Fix: compute the chunk hash in `_post_chunk_to_node()` and include it in the request headers.
+- Bug 2: The coordinator still only chunked locally and returned a count, so the storage nodes were never reached. This was visible from the existing `coordinator/main.py` flow, which had no call into `Replicator`. Fix: replaced the local file-write loop with replication calls and a structured per-chunk result.
+- Bug 3: The integration test needed isolated node state so that one node's stored chunks would not bleed into another test run. Fix: load the storage-node app into separate module instances and override each module's `STORAGE_DIR` with a temporary directory before creating the test client.
+
+Replicator and distributor outcome
+----------------------------------
+- `RoundRobinDistributor.assign_by_index()` worked as designed once it was used against real node URLs. No algorithmic changes were needed.
+- `Replicator.replicate_chunk()` also worked as designed for sequential replication. The only change required was aligning the HTTP request shape with the storage-node API.
+- In other words, the integration work did not require a new placement algorithm or a different replication strategy; it required wiring the existing pieces together with the correct transport contract.
+
+End of Day 3 report.

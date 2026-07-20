@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import urllib.request
 from typing import List
 
@@ -8,7 +9,10 @@ from .chunking import Chunk
 
 
 class ReplicationError(Exception):
-    pass
+    def __init__(self, message: str, successes: List[str] | None = None, errors: List[Exception] | None = None):
+        super().__init__(message)
+        self.successes = successes or []
+        self.errors = errors or []
 
 
 class Replicator:
@@ -58,12 +62,19 @@ class Replicator:
             raise ReplicationError(
                 f"Failed to achieve replication={self.replication_factor}; "
                 f"succeeded={len(successes)}; errors={errors}"
+                , successes=successes, errors=errors
             )
 
         return successes
 
     def _post_chunk_to_node(self, node_url: str, chunk: Chunk) -> None:
-        req = urllib.request.Request(node_url, data=chunk.data, method="POST")
+        chunk_hash = hashlib.sha256(chunk.data).hexdigest()
+        req = urllib.request.Request(
+            node_url,
+            data=chunk.data,
+            method="POST",
+            headers={"X-Chunk-Hash": chunk_hash},
+        )
         with urllib.request.urlopen(req, timeout=10) as resp:
             code = getattr(resp, "getcode", lambda: None)()
             if code is None:
