@@ -213,3 +213,17 @@ class MetadataUploadTests(unittest.TestCase):
                 get_response = self.node_clients[node_url].get(f"/chunks/{expected_hash}")
                 self.assertEqual(get_response.status_code, 200)
                 self.assertEqual(get_response.content, expected_data)
+
+    def test_download_rejects_non_committed_files(self) -> None:
+        client = TestClient(coordinator_main.app)
+
+        with self._session() as session:
+            uploading_file = FileRecord(filename="uploading.bin", size_bytes=123, status="uploading")
+            failed_file = FileRecord(filename="failed.bin", size_bytes=456, status="failed")
+            session.add(uploading_file)
+            session.add(failed_file)
+            session.commit()
+
+        for file_id in (uploading_file.id, failed_file.id):
+            response = client.get(f"/files/{file_id}/download")
+            self.assertEqual(response.status_code, 409)

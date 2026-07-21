@@ -8,6 +8,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+from urllib.error import HTTPError, URLError
 
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
@@ -29,6 +30,33 @@ class _UrlOpenResponse:
         return self._status_code
 
     def __enter__(self) -> "_UrlOpenResponse":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        return False
+
+
+class _DownloadResponse:
+    def __init__(self, payload: bytes, status_code: int = 200):
+        self._payload = payload
+        self._status_code = status_code
+        self.status_code = status_code
+        self.content = payload
+        self._offset = 0
+
+    def getcode(self) -> int:
+        return self._status_code
+
+    def read(self, size: int = -1) -> bytes:
+        if size is None or size < 0:
+            size = len(self._payload) - self._offset
+        if self._offset >= len(self._payload):
+            return b""
+        chunk = self._payload[self._offset : self._offset + size]
+        self._offset += len(chunk)
+        return chunk
+
+    def __enter__(self) -> "_DownloadResponse":
         return self
 
     def __exit__(self, exc_type, exc, tb) -> bool:
@@ -87,6 +115,16 @@ class UploadIntegrationTests(unittest.TestCase):
         response = target.post("/chunks", content=request.data, headers=headers)
         return _UrlOpenResponse(response.status_code)
 
+    def _fake_download_urlopen(self, request, timeout=10):
+        url = request.full_url if hasattr(request, "full_url") else str(request)
+        base_url = url.rsplit("/", 1)[0]
+        target = self.node_clients[base_url]
+        response = target.get(url[url.find("/chunks/") :])
+        status_code = getattr(response, "status_code", 200)
+        if status_code >= 400:
+            raise HTTPError(url, status_code, getattr(response, "text", "error"), hdrs=None, fp=None)
+        return _DownloadResponse(response.content, status_code)
+
     def test_upload_routes_chunks_to_storage_nodes(self) -> None:
         payload = (b"mini-drive-integration-test-" * 90000)[:2_600_000]
         self.assertGreater(len(payload), 1_048_576)
@@ -118,3 +156,82 @@ class UploadIntegrationTests(unittest.TestCase):
                 get_response = node_client.get(f"/chunks/{expected_hash}")
                 self.assertEqual(get_response.status_code, 200)
                 self.assertEqual(get_response.content, expected_data)
+
+    def test_upload_then_download_round_trips_exact_bytes(self) -> None:
+        payload = (b"mini-drive-round-trip-" * 90000)[:2_600_000]
+        expected_hash = hashlib.sha256(payload).hexdigest()
+
+        with patch("urllib.request.urlopen", side_effect=self._fake_urlopen):
+            upload_response = self.coordinator_client.post(
+                "/upload",
+                files={"file": ("roundtrip.bin", payload, "application/octet-stream")},
+            )
+
+        self.assertEqual(upload_response.status_code, 200)
+        file_id = upload_response.json()["file_id"]
+
+        with patch("urllib.request.urlopen", side_effect=self._fake_download_urlopen):
+            download_response = self.coordinator_client.get(f"/files/{file_id}/download")
+
+        self.assertEqual(download_response.status_code, 200)
+        self.assertEqual(download_response.content, payload)
+        self.assertEqual(hashlib.sha256(download_response.content).hexdigest(), expected_hash)
+        self.assertEqual(download_response.headers["content-disposition"], 'attachment; filename="roundtrip.bin"')
+
+    def test_download_falls_back_to_replica_when_primary_fails(self) -> None:
+        payload = (b"mini-drive-failover-" * 90000)[:2_600_000]
+
+        with patch("urllib.request.urlopen", side_effect=self._fake_urlopen):
+            upload_response = self.coordinator_client.post(
+                "/upload",
+                files={"file": ("failover.bin", payload, "application/octet-stream")},
+            )
+
+        self.assertEqual(upload_response.status_code, 200)
+        file_id = upload_response.json()["file_id"]
+
+        original_get = self.node_clients[self.node_urls[0]].get
+
+        def failing_primary_get(path, *args, **kwargs):
+            if path.startswith("/chunks/"):
+                return type("_FailResponse", (), {"status_code": 500, "text": "simulated failure"})()
+            return original_get(path, *args, **kwargs)
+
+        self.node_clients[self.node_urls[0]].get = failing_primary_get  # type: ignore[assignment]
+        try:
+            with patch("urllib.request.urlopen", side_effect=self._fake_download_urlopen):
+                download_response = self.coordinator_client.get(f"/files/{file_id}/download")
+        finally:
+            self.node_clients[self.node_urls[0]].get = original_get  # type: ignore[assignment]
+
+        self.assertEqual(download_response.status_code, 200)
+        self.assertEqual(download_response.content, payload)
+
+    def test_download_falls_back_to_replica_when_primary_bytes_fail_hash_check(self) -> None:
+        payload = (b"mini-drive-corrupt-primary-" * 90000)[:2_600_000]
+
+        with patch("urllib.request.urlopen", side_effect=self._fake_urlopen):
+            upload_response = self.coordinator_client.post(
+                "/upload",
+                files={"file": ("corrupt.bin", payload, "application/octet-stream")},
+            )
+
+        self.assertEqual(upload_response.status_code, 200)
+        file_id = upload_response.json()["file_id"]
+
+        original_get = self.node_clients[self.node_urls[0]].get
+
+        def corrupt_primary_get(path, *args, **kwargs):
+            if path.startswith("/chunks/"):
+                return _DownloadResponse(b"corrupt-primary-bytes")
+            return original_get(path, *args, **kwargs)
+
+        self.node_clients[self.node_urls[0]].get = corrupt_primary_get  # type: ignore[assignment]
+        try:
+            with patch("urllib.request.urlopen", side_effect=self._fake_download_urlopen):
+                download_response = self.coordinator_client.get(f"/files/{file_id}/download")
+        finally:
+            self.node_clients[self.node_urls[0]].get = original_get  # type: ignore[assignment]
+
+        self.assertEqual(download_response.status_code, 200)
+        self.assertEqual(download_response.content, payload)

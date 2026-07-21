@@ -307,3 +307,79 @@ Confirmation on the Day 3 pipeline
 - What changed was the control-plane sequencing: Day 4 adds persistence and an atomic metadata commit on top of the already working Day 3 upload flow.
 
 End of Day 4 report.
+
+Day 5 Report — MiniDrive
+========================
+
+Overview
+--------
+This document summarizes the Day 5 work for MiniDrive: adding the coordinator download endpoint, streaming chunk reassembly with replica failover, per-chunk integrity verification on download, and the verification/tests used to prove the round trip works end to end.
+
+Files updated (high level)
+- coordinator/main.py — added `GET /files/{file_id}/download` plus download-manifest, failover, and hash-verification helpers
+- tests/test_upload_integration.py — added round-trip download, primary-node failover, and corrupt-primary hash-verification tests
+- tests/test_upload_metadata.py — added non-committed download rejection coverage
+- day_wise_report.txt — appended this Day 5 report
+
+Day 5 Tasks (chronological)
+---------------------------
+1) Add the coordinator download endpoint (coordinator/main.py)
+   - What: Added `_load_download_manifest()` to load the file row, reject non-committed files, and collect chunks ordered by `chunk_index`; added `download_file()` to stream the reconstructed file back with `StreamingResponse` and content headers derived from the file record.
+   - Why: The coordinator now exposes the inverse of upload: a file can be reconstructed from metadata and chunk storage without loading the full payload into memory. Returning a streaming response keeps memory bounded by one chunk at a time.
+   - Trade-offs: The coordinator has to buffer one chunk long enough to verify it before yielding it. That is slightly more work than blindly proxying bytes, but it preserves integrity and avoids serving corrupted data.
+   - Alternatives considered:
+     * Read every chunk into memory, concatenate, and return a single body — simpler, but it breaks the no-full-buffering requirement for large files.
+     * Stream directly from the storage node to the client without verification — lower coordinator work, but it would allow a bad node response to pass through unchecked.
+   - Function-by-function:
+     * `_load_download_manifest()` loads file metadata, rejects `uploading`/`failed` records with 409, and builds the ordered chunk plan.
+     * `_is_retryable_download_error()` classifies transport failures and 404s as retryable.
+     * `_fetch_verified_chunk()` streams one chunk from a storage node, hashes it locally, and checks both size and digest.
+     * `_download_chunk_with_failover()` tries the primary location first and then the remaining replicas if the primary fails or fails verification.
+     * `download_file()` wraps the chunk iterator in `StreamingResponse` and sets filename/content headers.
+
+2) Make replication matter on the download path (coordinator/main.py)
+   - What: Added failover so a chunk can be fetched from a replica if the primary is unreachable or serves bad bytes.
+   - Why: Replication only helps if the coordinator can actually use the copies when the primary is down or corrupted. This turns replication from passive redundancy into active availability.
+   - Trade-offs: The retry logic adds a little latency on the unhappy path, but only for chunks that fail. The happy path still uses the primary first.
+   - Alternatives considered:
+     * Pick a replica up front and ignore the primary — easier failover semantics, but it wastes the primary copy in normal operation.
+     * Retry the same node repeatedly — pointless when the failure is node-local or data-local.
+
+3) Add hash verification on download (coordinator/main.py)
+   - What: Verified each streamed chunk against the expected SHA-256 from the database before yielding it to the client.
+   - Why: Write-time hash checks only prove the original upload was correct at the moment it was stored. Download-time verification catches later corruption or wrong-object serving, such as disk rot, accidental overwrite, or a bug that returns the wrong chunk for a hash.
+   - Trade-offs: Verification means the coordinator has to read each chunk once before emitting it, so the response is still streaming but not zero-copy pass-through.
+   - Alternatives considered:
+     * Trust the storage node and skip verification — faster, but it would miss post-write corruption and wrong-chunk bugs.
+     * Hash only the whole file after download — useful for end-to-end auditing, but too late to avoid streaming bad bytes to the client.
+
+4) Add tests for round-trip download, failover, and edge cases (tests/*)
+   - What: Added an integration test that uploads a multi-chunk payload, downloads it back, and compares the SHA-256 of the reconstructed bytes to the original. Added a failover test where the primary node returns an error, plus a hash-mismatch test where the primary serves corrupt bytes and the replica is used instead. Added an edge-case test for `uploading` and `failed` files returning 409.
+   - Why: These tests prove the download path is correct in the normal case, durable under node failure, and safe against partial/in-progress metadata states.
+   - Trade-offs: The tests use in-process FastAPI apps and monkeypatched `urllib.request.urlopen`, so they validate the HTTP contract and coordinator behavior but not external process supervision.
+   - Alternatives considered:
+     * Mock the database and storage nodes entirely — faster, but it would not prove the streaming and response behavior end to end.
+     * Spin up separate OS processes for each storage node — closer to production, but much heavier for a day-level verification pass.
+
+Testing and validation
+----------------------
+- Ran the focused test suite: `python -m unittest tests.test_upload_integration tests.test_upload_metadata` — passed.
+- Ran a manual end-to-end round trip with a fresh multi-chunk payload: uploaded through the coordinator, downloaded through `GET /files/{file_id}/download`, and compared the original and reconstructed SHA-256 digests — matched exactly.
+
+Debugging log
+-------------
+- Bug 1: The first download-failover test broke because the fake download response object used by the test transport did not expose the same attributes as a real HTTP response. The coordinator correctly handled retryable errors, but the test shim needed `status_code` and `content` so the transport could hand bytes back to the client. Fix: add those attributes to the fake response wrapper and rerun the same focused suite.
+- Bug 2: The corrupt-primary test was valuable because it exercised the new hash-verification branch, not just the network-error branch. That confirmed the coordinator does not trust a node simply because it answered successfully; it revalidates the bytes before yielding them.
+
+Function summary
+-----------------
+- `_load_download_manifest(file_id)` — resolve the committed file and ordered chunk plan from PostgreSQL.
+- `_fetch_verified_chunk(node_url, chunk_hash, expected_size_bytes)` — stream a chunk from one node and verify it locally.
+- `_download_chunk_with_failover(chunk)` — retry across replicas until one node returns a valid chunk or all locations fail.
+- `download_file(file_id)` — return the reconstructed file as a streaming HTTP response.
+- `test_upload_then_download_round_trips_exact_bytes()` — prove upload/download byte-for-byte correctness.
+- `test_download_falls_back_to_replica_when_primary_fails()` — prove transport failover works.
+- `test_download_falls_back_to_replica_when_primary_bytes_fail_hash_check()` — prove hash verification triggers replica fallback.
+- `test_download_rejects_non_committed_files()` — prove incomplete uploads are rejected instead of streamed.
+
+End of Day 5 report.
