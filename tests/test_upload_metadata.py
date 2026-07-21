@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import hashlib
+import concurrent.futures
 import importlib.util
 import io
+import threading
 import sys
 import tempfile
 import unittest
@@ -64,6 +66,7 @@ class MetadataUploadTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
         self.root = Path(self.temp_dir.name)
+        self.rename_engine = None
 
         self.engine = create_engine(
             "sqlite+pysqlite:///:memory:",
@@ -77,6 +80,8 @@ class MetadataUploadTests(unittest.TestCase):
         self.node_urls = []
 
     def tearDown(self) -> None:
+        if self.rename_engine is not None:
+            self.rename_engine.dispose()
         self.temp_dir.cleanup()
 
     def _attach_in_process_nodes(self, node_count: int = 2) -> None:
@@ -103,6 +108,15 @@ class MetadataUploadTests(unittest.TestCase):
 
     def _session(self):
         return coordinator_main.SessionLocal()
+
+    def _rebind_file_database(self, file_path: Path) -> None:
+        engine = create_engine(
+            f"sqlite+pysqlite:///{file_path}",
+            connect_args={"check_same_thread": False},
+        )
+        Base.metadata.create_all(engine)
+        coordinator_main.SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False)
+        self.rename_engine = engine
 
     def test_successful_upload_commits_file_chunks_and_locations(self) -> None:
         self._attach_in_process_nodes(2)
@@ -213,6 +227,84 @@ class MetadataUploadTests(unittest.TestCase):
                 get_response = self.node_clients[node_url].get(f"/chunks/{expected_hash}")
                 self.assertEqual(get_response.status_code, 200)
                 self.assertEqual(get_response.content, expected_data)
+
+    def test_concurrent_rename_naive_loses_updates_but_optimistic_and_pessimistic_do_not(self) -> None:
+        db_path = self.root / "rename_race.sqlite3"
+        self._rebind_file_database(db_path)
+        client = TestClient(coordinator_main.app)
+
+        with self._session() as session:
+            file_row = FileRecord(filename="original.txt", size_bytes=1, status="committed")
+            session.add(file_row)
+            session.commit()
+            file_id = file_row.id
+
+        rename_names = [f"name-{index}.txt" for index in range(10)]
+        barrier = threading.Barrier(len(rename_names))
+
+        def delayed_naive(file_id: int, new_name: str):
+            with coordinator_main.SessionLocal() as session:
+                with session.begin():
+                    file_row = session.get(FileRecord, file_id)
+                    if file_row is None:
+                        raise RuntimeError("missing file")
+                    previous_name = file_row.filename
+                    barrier.wait()
+                    file_row.filename = new_name
+                    file_row.version = file_row.version + 1
+                    session.flush()
+                    session.refresh(file_row)
+                    return file_row, previous_name
+
+        original_naive = coordinator_main._rename_file_naive
+        try:
+            with patch.object(coordinator_main, "_rename_file_naive", side_effect=delayed_naive):
+                with concurrent.futures.ThreadPoolExecutor(max_workers=len(rename_names)) as executor:
+                    responses = list(
+                        executor.map(
+                            lambda new_name: client.put(
+                                f"/files/{file_id}/rename",
+                                json={"new_name": new_name, "strategy": "naive"},
+                            ),
+                            rename_names,
+                        )
+                    )
+
+            self.assertEqual([response.status_code for response in responses], [200] * len(rename_names))
+            with self._session() as session:
+                final_row = session.get(FileRecord, file_id)
+                self.assertIsNotNone(final_row)
+                self.assertLess(final_row.version, len(rename_names))
+                self.assertIn(final_row.filename, rename_names)
+
+            with self._session() as session:
+                reset_row = session.get(FileRecord, file_id)
+                self.assertIsNotNone(reset_row)
+                reset_row.filename = "original.txt"
+                reset_row.version = 0
+                session.commit()
+
+            barrier = threading.Barrier(len(rename_names))
+
+            def start_rename(new_name: str):
+                barrier.wait()
+                return client.put(
+                    f"/files/{file_id}/rename",
+                    json={"new_name": new_name, "strategy": "optimistic"},
+                )
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=len(rename_names)) as executor:
+                responses = list(executor.map(start_rename, rename_names))
+
+            self.assertEqual([response.status_code for response in responses], [200] * len(rename_names))
+
+            with self._session() as session:
+                final_row = session.get(FileRecord, file_id)
+                self.assertIsNotNone(final_row)
+                self.assertEqual(final_row.version, len(rename_names))
+                self.assertIn(final_row.filename, rename_names)
+        finally:
+            coordinator_main._rename_file_naive = original_naive
 
     def test_download_rejects_non_committed_files(self) -> None:
         client = TestClient(coordinator_main.app)

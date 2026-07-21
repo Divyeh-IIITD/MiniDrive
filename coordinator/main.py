@@ -7,8 +7,9 @@ import urllib.error
 import urllib.request
 from typing import List
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from fastapi.responses import JSONResponse, Response, StreamingResponse
+from sqlalchemy import update
 
 from coordinator.db import ChunkLocationRecord, ChunkRecord, FileRecord, SessionLocal
 from minidrive.config import REPLICATION_FACTOR, STORAGE_NODE_URLS
@@ -95,6 +96,80 @@ def _commit_upload_metadata(file_id: int, size_bytes: int, chunk_results: List[d
 
             file_row.size_bytes = size_bytes
             file_row.status = "committed"
+
+
+def _rename_file_naive(file_id: int, new_name: str) -> tuple[FileRecord, str]:
+    with SessionLocal() as session:
+        with session.begin():
+            file_row = session.get(FileRecord, file_id)
+            if file_row is None:
+                raise HTTPException(status_code=404, detail="file not found")
+            current_name = file_row.filename
+            file_row.filename = new_name
+            file_row.version = file_row.version + 1
+            session.flush()
+            session.refresh(file_row)
+            return file_row, current_name
+
+
+def _rename_file_pessimistic(file_id: int, new_name: str) -> tuple[FileRecord, str]:
+    with SessionLocal() as session:
+        with session.begin():
+            file_row = (
+                session.query(FileRecord)
+                .filter(FileRecord.id == file_id)
+                .with_for_update()
+                .one_or_none()
+            )
+            if file_row is None:
+                raise HTTPException(status_code=404, detail="file not found")
+            previous_name = file_row.filename
+            file_row.filename = new_name
+            file_row.version = file_row.version + 1
+            session.flush()
+            session.refresh(file_row)
+            return file_row, previous_name
+
+
+def _rename_file_optimistic(file_id: int, new_name: str, max_attempts: int = 5) -> tuple[FileRecord, str]:
+    for _ in range(max_attempts):
+        with SessionLocal() as read_session:
+            file_row = read_session.get(FileRecord, file_id)
+            if file_row is None:
+                raise HTTPException(status_code=404, detail="file not found")
+
+            expected_version = file_row.version
+            previous_name = file_row.filename
+
+        with SessionLocal() as write_session:
+            with write_session.begin():
+                update_result = write_session.execute(
+                    update(FileRecord)
+                    .where(FileRecord.id == file_id, FileRecord.version == expected_version)
+                    .values(filename=new_name, version=expected_version + 1)
+                    .execution_options(synchronize_session=False)
+                )
+
+                if update_result.rowcount != 1:
+                    continue
+
+                refreshed_row = write_session.get(FileRecord, file_id)
+                if refreshed_row is None:
+                    raise HTTPException(status_code=404, detail="file not found")
+                write_session.refresh(refreshed_row)
+                return refreshed_row, previous_name
+
+    raise HTTPException(status_code=409, detail="rename conflict; please retry")
+
+
+def _rename_file(file_id: int, new_name: str, strategy: str) -> tuple[FileRecord, str]:
+    if strategy == "naive":
+        return _rename_file_naive(file_id, new_name)
+    if strategy == "pessimistic":
+        return _rename_file_pessimistic(file_id, new_name)
+    if strategy == "optimistic":
+        return _rename_file_optimistic(file_id, new_name)
+    raise HTTPException(status_code=400, detail="rename strategy must be naive, pessimistic, or optimistic")
 
 
 def _load_download_manifest(file_id: int) -> tuple[str, int, List[dict]]:
@@ -187,6 +262,27 @@ def _download_chunk_with_failover(chunk: dict) -> bytes:
     )
 
 
+def _file_etag(file_id: int) -> str:
+    with SessionLocal() as session:
+        file_row = session.get(FileRecord, file_id)
+        if file_row is None:
+            raise HTTPException(status_code=404, detail="file not found")
+        if file_row.status != "committed":
+            raise HTTPException(status_code=409, detail=f"file {file_id} is not ready for download")
+
+        chunk_rows = (
+            session.query(ChunkRecord.hash)
+            .filter(ChunkRecord.file_id == file_id)
+            .order_by(ChunkRecord.chunk_index.asc())
+            .all()
+        )
+        hasher = hashlib.sha256()
+        for (chunk_hash,) in chunk_rows:
+            hasher.update(chunk_hash.encode("utf-8"))
+        hasher.update(str(file_row.size_bytes).encode("utf-8"))
+        return f'"{hasher.hexdigest()}"'
+
+
 # WHAT: Accept a file upload and stream it into fixed-size chunk files on disk.
 # WHY: Streaming via `iter_chunks` keeps the memory footprint at O(chunk_size)
 #      instead of O(file_size). This avoids spiking memory for large uploads and
@@ -271,12 +367,37 @@ async def upload(file: UploadFile = File(...), chunk_size: int = DEFAULT_CHUNK_S
     )
 
 
+@app.put("/files/{file_id}/rename")
+async def rename_file(file_id: int, request: Request) -> JSONResponse:
+    payload = await request.json()
+    new_name = payload.get("new_name")
+    strategy = payload.get("strategy", "optimistic")
+
+    if not isinstance(new_name, str) or not new_name.strip():
+        raise HTTPException(status_code=400, detail="new_name must be a non-empty string")
+
+    renamed_row, previous_name = _rename_file(file_id, new_name.strip(), strategy)
+    return JSONResponse(
+        {
+            "file_id": renamed_row.id,
+            "previous_filename": previous_name,
+            "filename": renamed_row.filename,
+            "version": renamed_row.version,
+            "strategy": strategy,
+        }
+    )
+
+
 # WHAT: Reassemble a committed file by streaming its verified chunks back in order.
 # WHY: This is the point where replication pays off. The coordinator can treat multiple chunk copies as interchangeable fallbacks, which turns a single-node outage into a normal retry instead of a user-visible failure.
 # TRADE-OFF: We verify and buffer one chunk at a time before yielding it, which preserves bounded memory usage while still allowing failover and integrity checks; a mid-stream failure can still truncate an already-started response, but it cannot contaminate later chunks with unverified bytes.
 @app.get("/files/{file_id}/download")
-async def download_file(file_id: int):
+async def download_file(file_id: int, request: Request):
     filename, file_size_bytes, chunk_manifest = _load_download_manifest(file_id)
+    etag = _file_etag(file_id)
+
+    if request.headers.get("if-none-match") == etag:
+        return Response(status_code=304, headers={"ETag": etag, "X-File-Filename": filename})
 
     def chunk_stream():
         for chunk in chunk_manifest:
@@ -286,6 +407,7 @@ async def download_file(file_id: int):
         "Content-Disposition": f'attachment; filename="{filename}"',
         "Content-Length": str(file_size_bytes),
         "X-File-Filename": filename,
+        "ETag": etag,
     }
 
     return StreamingResponse(chunk_stream(), media_type="application/octet-stream", headers=headers)

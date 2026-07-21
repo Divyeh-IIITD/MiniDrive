@@ -383,3 +383,156 @@ Function summary
 - `test_download_rejects_non_committed_files()` — prove incomplete uploads are rejected instead of streamed.
 
 End of Day 5 report.
+
+Day 6 Report — MiniDrive
+========================
+
+Overview
+--------
+This document summarizes the Day 6 work for MiniDrive: the concurrent rename race, the two rename fixes, the conditional GET / ETag download optimization, and the validation used to prove the race behavior and the download short-circuiting.
+
+Files updated (high level)
+- coordinator/main.py — added `PUT /files/{file_id}/rename`, rename strategy helpers, file versioning, and conditional GET support for downloads
+- coordinator/db.py — added a `version` column on `files`
+- migrations/versions/0002_file_version_and_rename_support.py — schema migration for the new version column
+- scripts/rename_race_demo.py — standalone race demo that fires 10 concurrent rename requests
+- tests/test_upload_metadata.py — added race reproduction and fixed-rename validation
+- tests/test_upload_integration.py — added ETag / 304 conditional download coverage
+
+Part 1 — Concurrent rename
+--------------------------
+1) Add the rename endpoint and the naive version (coordinator/main.py)
+   - What: Added `PUT /files/{file_id}/rename` and a naive helper that reads the current filename, writes the new one, and increments `version` without any lock or compare-and-swap.
+   - Why: The naive path is the simplest way to reproduce the lost-update race and prove why the fix is needed.
+   - Trade-offs: It is intentionally unsafe. Two concurrent requests can both read the same row version and both report success, even though only one update really survives in the final state.
+   - Alternatives considered:
+     * Read-only rename preview — useful for UX, but it would not demonstrate the race.
+     * Queue all renames through a worker — safer, but it hides the concurrency bug instead of surfacing it.
+
+2) Fix rename with optimistic concurrency (coordinator/main.py, coordinator/db.py)
+   - What: Added a `version` integer column to `files` and implemented `_rename_file_optimistic()` as a compare-and-swap loop: read current version, issue a conditional `UPDATE ... WHERE version = expected_version`, and retry on conflict.
+   - Why: Optimistic concurrency is the default because it is portable across the current SQLite-based test harness and PostgreSQL, and it keeps throughput high under low contention.
+   - Trade-offs: It needs retry logic, and under heavy contention some requests may spin more than a lock-based approach. That is acceptable here because rename contention is expected to be low.
+   - Alternatives considered:
+     * Pessimistic locking with `SELECT ... FOR UPDATE` — safer under high contention, but it blocks and is backend-dependent.
+     * Last-write-wins updates without versioning — simpler, but it loses updates silently.
+   - Function-by-function:
+     * `_rename_file_naive()` is the intentionally racy path used for the demo script and test reproduction.
+     * `_rename_file_optimistic()` is the default rename implementation.
+     * `_rename_file_pessimistic()` remains available as the lock-based alternative for Postgres deployments.
+     * `rename_file()` dispatches by strategy and returns the previous and current filenames plus the row version.
+
+3) Keep pessimistic locking as the documented alternative (coordinator/main.py)
+   - What: Added `_rename_file_pessimistic()` using `SELECT ... FOR UPDATE` on the target file row.
+   - Why: This is the stronger choice when the deployment has real database row locking and rename contention is expected to be high.
+   - Trade-offs: On the current SQLite harness, `FOR UPDATE` is not enforced the way it is on PostgreSQL, so the demo script shows that this path is backend-limited in tests. That is why the optimistic strategy is the actual default in this codebase.
+   - Alternatives considered:
+     * Application-level mutexes — easy to implement, but they do not scale across multiple processes.
+     * Advisory locks — workable on Postgres, but they add another coordination surface.
+
+4) Add the race demo script and the race test (scripts/rename_race_demo.py, tests/test_upload_metadata.py)
+   - What: Added a script that fires 10 concurrent rename requests against one file ID and prints the responses and final DB state. Added a test that reproduces the naive lost-update race and confirms the optimistic strategy preserves all 10 updates.
+   - Why: The script produces a concrete failure trace for the report, and the test keeps the fix from regressing.
+   - Trade-offs: The script uses an in-process SQLite fixture so it is easy to run, but that means the pessimistic lock path is backend-sensitive; the optimistic path is the one verified end to end in the harness.
+   - Alternatives considered:
+     * Drive the demo through a live HTTP server — closer to production, but slower and harder to reproduce.
+     * Mock the race completely — faster, but it would not show the real update ordering.
+
+5) Thread-safety check for upload chunk tracking
+   - What: Rechecked the Day 4 upload flow. The per-chunk tracking is request-local (`chunk_results` is allocated inside `upload()`), so there is no shared in-memory state across requests to lock.
+   - Why: The code path is already thread-safe because each request has its own list and the transactional DB writes are the shared boundary.
+   - Trade-offs: No additional lock was needed, which keeps the hot upload path simpler.
+   - Alternatives considered:
+     * Add a global lock anyway — unnecessary, and it would serialize uploads for no benefit.
+
+Part 2 — Conditional GET / ETag
+------------------------------
+1) Add ETag generation to downloads (coordinator/main.py)
+   - What: Added `_file_etag()` to hash the ordered chunk hashes plus the file size, and added the resulting ETag header to successful downloads.
+   - Why: The file content is already represented by chunk hashes in the schema, so hashing the ordered chunk hashes is a cheap, deterministic validator for the reconstructed file.
+   - Trade-offs: This is not a byte-for-byte full-file hash, but it is consistent with the current schema and avoids re-reading all chunk bytes just to compute validators.
+   - Alternatives considered:
+     * Store a full-file digest at upload time — stronger, but it requires another field and another commit-time write.
+     * Hash the streamed bytes during every download — accurate, but it duplicates the work we already know from chunk metadata.
+
+2) Add conditional GET short-circuiting (coordinator/main.py)
+   - What: `download_file()` now checks `If-None-Match`; when the client’s validator matches the current ETag, it returns `304 Not Modified` with no body.
+   - Why: This avoids re-streaming the file when the client already has the current version.
+   - Trade-offs: The validator check is exact-match based, which is enough for this stage but does not yet parse complex validator lists or weak validators.
+   - Alternatives considered:
+     * Use `Last-Modified` only — easy, but it is less precise for content identity.
+     * Always stream the body — simplest, but it wastes bandwidth when the client cache is current.
+
+3) Add the conditional GET test (tests/test_upload_integration.py)
+   - What: Added a test that uploads a file, downloads it once to capture the ETag, then requests the same download again with `If-None-Match` and expects `304` with an empty body.
+   - Why: This proves the cache validator is wired end to end, not just attached as a header.
+   - Trade-offs: The test exercises the same integration transport as the normal download path, so it covers the important behavior without pulling in another fake layer.
+
+Testing and validation
+----------------------
+- Ran the focused suite: `python -m unittest tests.test_upload_metadata tests.test_upload_integration` — passed.
+- Ran the standalone race demo in naive mode:
+
+```json
+{
+  "final_state": {
+    "file_id": 1,
+    "filename": "rename-5.txt",
+    "version": 1
+  },
+  "responses": [
+    {
+      "body": {
+        "file_id": 1,
+        "filename": "rename-0.txt",
+        "previous_filename": "original.txt",
+        "strategy": "naive",
+        "version": 1
+      },
+      "status_code": 200
+    }
+  ]
+}
+```
+
+- Ran the standalone race demo in optimistic mode:
+
+```json
+{
+  "final_state": {
+    "file_id": 1,
+    "filename": "rename-3.txt",
+    "version": 10
+  }
+}
+```
+
+Debugging log
+-------------
+- Bug 1: The naive rename demo showed a classic lost-update race. All 10 concurrent requests returned `200`, but every response reported `previous_filename: "original.txt"` and the final row ended at `version: 1`, which means the requests all read the same stale state and overwrote each other. The demo output made the bug obvious:
+
+```json
+{
+  "final_state": {
+    "file_id": 1,
+    "filename": "rename-5.txt",
+    "version": 1
+  }
+}
+```
+
+- Bug 2: The first optimistic implementation still collapsed to a single update under SQLite because the read and conditional write were too tightly coupled. Fix: split the read and write into separate sessions and use an explicit `UPDATE ... WHERE version = expected_version` retry loop. After that, the optimistic demo finished with `version: 10`, which confirmed that all 10 updates were serialized rather than lost.
+
+- Bug 3: The pessimistic demo on this SQLite harness still ended at `version: 1`. That is a backend limitation, not a coordinator bug: SQLite does not enforce `SELECT ... FOR UPDATE` the way PostgreSQL does. This is why the codebase uses optimistic concurrency as the default and keeps pessimistic locking as the documented Postgres-oriented alternative.
+
+Function summary
+----------------
+- `_rename_file_naive(file_id, new_name)` — racy read/write rename used to reproduce the bug.
+- `_rename_file_pessimistic(file_id, new_name)` — lock-based rename for Postgres-style row locking.
+- `_rename_file_optimistic(file_id, new_name, max_attempts=5)` — compare-and-swap rename with retries; the default implementation.
+- `rename_file(file_id, request)` — dispatches rename strategy and returns previous/current filenames and version.
+- `_file_etag(file_id)` — compute the download validator from chunk hashes and file size.
+- `download_file(file_id, request)` — stream the file or return `304 Not Modified` when the ETag matches.
+- `scripts/rename_race_demo.py` — standalone concurrent rename demo for naive/optimistic/pessimistic comparison.
+
+End of Day 6 report.

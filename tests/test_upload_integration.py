@@ -235,3 +235,32 @@ class UploadIntegrationTests(unittest.TestCase):
 
         self.assertEqual(download_response.status_code, 200)
         self.assertEqual(download_response.content, payload)
+
+    def test_download_sets_etag_and_supports_conditional_get(self) -> None:
+        payload = (b"etag-test-" * 90000)[:2_600_000]
+
+        with patch("urllib.request.urlopen", side_effect=self._fake_urlopen):
+            upload_response = self.coordinator_client.post(
+                "/upload",
+                files={"file": ("etag.bin", payload, "application/octet-stream")},
+            )
+
+        self.assertEqual(upload_response.status_code, 200)
+        file_id = upload_response.json()["file_id"]
+
+        with patch("urllib.request.urlopen", side_effect=self._fake_download_urlopen):
+            first_download = self.coordinator_client.get(f"/files/{file_id}/download")
+
+        self.assertEqual(first_download.status_code, 200)
+        etag = first_download.headers["etag"]
+        self.assertTrue(etag)
+        self.assertEqual(first_download.content, payload)
+
+        with patch("urllib.request.urlopen", side_effect=self._fake_download_urlopen):
+            second_download = self.coordinator_client.get(
+                f"/files/{file_id}/download",
+                headers={"If-None-Match": etag},
+            )
+
+        self.assertEqual(second_download.status_code, 304)
+        self.assertEqual(second_download.content, b"")
