@@ -1,58 +1,110 @@
 # MiniDrive
 
-This workspace contains a small, interview-focused prototype of a distributed
-file store.
+MiniDrive is a compact distributed file-store prototype with a Python/FastAPI coordinator, replicated storage nodes, a SQL metadata layer, and a Vite + React frontend.
+
+## What It Does
+
+- Streams uploads into fixed-size chunks.
+- Replicates chunks across storage nodes.
+- Persists file, chunk, and replica metadata atomically.
+- Streams downloads back through the coordinator with failover, hash verification, and conditional GET support.
+- Shows upload progress in the browser and polls file status instead of keeping a persistent socket open.
+- Highlights duplicate files in the file list and lets you delete server-side entries from the UI.
+
+## UI
+
+- Minimal pastel landing layout with floating status cards.
+- Upload panel with byte-level progress bar.
+- File ledger with duplicate highlighting, download, delete, and refresh actions.
 
 ## Repository Layout
 
-- `coordinator/` — FastAPI app for upload orchestration and chunking.
-- `storage-node/` — FastAPI launcher for the storage node server.
-- `storage_node/` — Importable Python package containing the storage-node API.
-- `frontend/` — Vite + React scaffold (basic placeholder).
-- `minidrive/` — Shared Python utilities, including chunking and distribution.
-- `tests/` — Unit tests for chunking, distribution, replication, and storage-node behavior.
+- `coordinator/` - FastAPI control plane for uploads, file listing, status, downloads, and rename operations.
+- `storage_node/` - FastAPI storage-node implementation.
+- `storage-node/` - Legacy launcher for the storage node.
+- `frontend/` - Vite + React UI for uploads, polling, file listing, and downloads.
+- `minidrive/` - Shared chunking, placement, configuration, and replication utilities.
+- `migrations/` - Alembic schema migrations.
+- `scripts/` - Utility scripts, including the rename race demo and load test.
+- `docs/` - Design, milestone, debugging, architecture, and function-rationale notes.
+- `tests/` - Unit and integration tests.
 
-## Implemented So Far
+## Setup
 
-- Day 1: streaming file chunking with a generator, round-robin distribution,
-  replication scaffolding, coordinator scaffold, and frontend scaffold.
-- Day 2: storage-node API with content-addressed storage:
-  - `POST /chunks` stores chunk bytes under a hash-based path.
-  - `GET /chunks/{hash}` returns raw chunk bytes.
-  - `DELETE /chunks/{hash}` deletes a stored chunk.
+Python 3.13 is the validated interpreter in this workspace. Install backend dependencies with:
 
-The storage node uses hash-prefix directories similar to git object storage.
-That keeps directories from getting too large, supports deduplication, and makes
-integrity verification straightforward.
+```bash
+pip install -r requirements.txt
+```
 
-Python requirements (for coordinator/storage-node): see `requirements.txt`.
+For the frontend:
 
-To run the tests for the Python library:
+```bash
+cd frontend
+npm install
+```
+
+## Run
+
+Fastest local start on Windows:
+
+```powershell
+./start-dev.ps1
+```
+
+That launcher installs dependencies if needed, creates a local SQLite DB, starts three isolated storage nodes, starts the coordinator, and opens the frontend dev server in separate PowerShell windows.
+
+The frontend uses `http://127.0.0.1:8000` by default, so the upload UI works immediately after the launcher starts.
+
+If you want to skip reinstalling packages, use:
+
+```powershell
+./start-dev.ps1 -SkipInstall
+```
+
+Start the coordinator:
+
+```bash
+python -m uvicorn coordinator.main:app --reload --port 8000
+```
+
+Start the storage node:
+
+```bash
+python -m uvicorn storage_node.main:app --reload --port 8001
+```
+
+Start the frontend:
+
+```bash
+cd frontend
+npm run dev
+```
+
+If your frontend is served on the default Vite port, it will talk to `http://127.0.0.1:8000` unless you override `VITE_API_BASE_URL`.
+
+## Test
+
+Run the Python test suite:
 
 ```bash
 python -m unittest discover -s tests
 ```
 
-To run the coordinator locally (example):
+Run the focused load test:
 
 ```bash
-pip install -r requirements.txt
-uvicorn coordinator.main:app --reload --port 8000
+python scripts/load_test.py --files 24 --workers 8
 ```
 
-To run the storage node locally:
+## Notes
 
-```bash
-uvicorn storage_node.main:app --reload --port 8001
-```
+- The frontend uses polling for upload status because it is simpler than maintaining a WebSocket connection for this scale.
+- The storage node uses hash-prefix sharding similar to git object storage to keep directories manageable.
+- The coordinator exposes `GET /files`, `GET /files/{file_id}/status`, and `GET /files/{file_id}/download` for the browser UI.
+- For local development, `start-dev.ps1` launches a SQLite-backed coordinator plus three isolated storage nodes on ports 8001, 8002, and 8003.
 
-To run the storage-node launcher from the legacy path:
-
-```bash
-python storage-node/main.py
-```
-
-Example storage-node API usage:
+## API Examples
 
 ```bash
 curl -X POST http://127.0.0.1:8001/chunks \
